@@ -32,9 +32,6 @@ import java.io.PipedInputStream
 import java.io.PipedOutputStream
 
 
-
-
-
 class RemoteAgentService : Service() {
 
     private lateinit var server: NanoHTTPD
@@ -43,6 +40,23 @@ class RemoteAgentService : Service() {
         super.onCreate()
         startForeground(1, createNotification())
         startServer()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // If service is killed by the system, restart it
+        return START_STICKY
+    }
+
+    // ✅ Add this method
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Restart service if app is swiped away
+        val restartServiceIntent = Intent(applicationContext, RemoteAgentService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(restartServiceIntent)
+        } else {
+            startService(restartServiceIntent)
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun startServer() {
@@ -342,11 +356,6 @@ class RemoteAgentService : Service() {
             json
         )
     }
-
-
-
-
-
 
 
     private fun createNotification(): Notification {
