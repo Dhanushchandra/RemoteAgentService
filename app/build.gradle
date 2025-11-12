@@ -75,6 +75,11 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // --- Gson (for JSON serialization) ---
+
+    // OkHttp (HTTP + WebSocket)
+    implementation("com.squareup.okio:okio:3.4.0") // optional
+
+    // Gson for JSON
     implementation("com.google.code.gson:gson:2.11.0")
+    implementation "org.java-websocket:Java-WebSocket:1.5.3"
 }

