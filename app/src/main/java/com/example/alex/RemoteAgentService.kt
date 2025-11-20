@@ -68,6 +68,14 @@ class RemoteAgentService : Service() {
     private var wsClient: WebSocketClient? = null
     private val deviceId = "android-device-001" // give a unique ID per device
 
+    companion object {
+        private const val SERVER_IP = "192.168.31.50"
+        private const val SERVER_PORT = 3003
+
+        const val WS_URL = "ws://$SERVER_IP:$SERVER_PORT/ws"
+        const val HTTP_BASE = "http://$SERVER_IP:$SERVER_PORT"
+    }
+
 
     override fun onCreate() {
         super.onCreate()
@@ -105,7 +113,7 @@ class RemoteAgentService : Service() {
         println("🌐 Trying to connect to WebSocket...")
 
         try {
-            val serverUri = URI("ws://192.168.31.50:3003/ws")
+            val serverUri = URI(WS_URL)
             wsClient = object : WebSocketClient(serverUri) {
 
                 override fun onOpen(handshakedata: ServerHandshake?) {
@@ -416,7 +424,7 @@ class RemoteAgentService : Service() {
                     if (bytes != null) {
                         val whichStr =
                             if (facing == CameraCharacteristics.LENS_FACING_FRONT) "front" else "back"
-                        val url = URL("http://192.168.31.50:3003/capture?which=$whichStr")
+                        val url = URL("$HTTP_BASE/capture?which=$whichStr")
                         val conn = url.openConnection() as HttpURLConnection
                         conn.requestMethod = "POST"
                         conn.doOutput = true
@@ -473,7 +481,7 @@ class RemoteAgentService : Service() {
 
         Thread {
             try {
-                val url = URL("http://192.168.31.50:3003/contacts")
+                val url = URL("$HTTP_BASE/contacts")
                 val conn = (url.openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     doOutput = true
@@ -505,7 +513,7 @@ class RemoteAgentService : Service() {
 
         Thread {
             try {
-                val url = URL("http://192.168.31.50:3003/files")
+                val url = URL("$HTTP_BASE/files")
                 val conn = (url.openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     doOutput = true
@@ -980,14 +988,14 @@ class RemoteAgentService : Service() {
             return
         }
 
-        val wsUrl = "ws://192.168.31.50:3003/ws"
+        val wsUrl = WS_URL
         val client = OkHttpClient()
         val request = Request.Builder().url(wsUrl).build()
         val ws = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 println("📡 Connected to Node.js WS")
                 try {
-                    webSocket.send("""{"type":"video_stream","deviceId":"android-device-001"}""")
+                    webSocket.send("""{"type":"video_stream","deviceId":"$deviceId"}""")
                 } catch (e: Exception) {
                     println("❌ WS send in onOpen failed: ${e.message}")
                 }
