@@ -442,6 +442,7 @@ class RemoteAgentService : Service() {
                         conn.requestMethod = "POST"
                         conn.doOutput = true
                         conn.setRequestProperty("Content-Type", "image/jpeg")
+                        conn.setRequestProperty("X-Device-Id", deviceId)
                         conn.setRequestProperty(
                             "Authorization",
                             "Device $DEVICE_SECRET"
@@ -503,6 +504,7 @@ class RemoteAgentService : Service() {
                     requestMethod = "POST"
                     doOutput = true
                     setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("X-Device-Id", deviceId)
                     setRequestProperty(
                         "Authorization",
                         "Device $DEVICE_SECRET"
